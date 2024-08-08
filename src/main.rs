@@ -4,13 +4,19 @@
 
 use core::{mem::MaybeUninit, ptr::addr_of_mut, str::FromStr};
 
+
 use esp_backtrace as _;
 use esp_hal::{
     clock::{ClockControl, CpuClock},
     cpu_control::{CpuControl, Stack as CPUStack},
-    gpio::{Io, Level, Output, GpioPin},
-    i2c::I2C,
-    peripherals::{Peripherals, I2C0},
+    gpio::{any_pin::AnyPin, Io, Level, Output, GpioPin},
+    dma_descriptors,
+    dma::{Dma, DmaPriority, Channel0},
+    spi::{
+        master::{Spi, dma::SpiDma, prelude::*},
+        SpiMode, FullDuplexMode
+    },
+    peripherals::{Peripherals, SPI2},
     prelude::*,
     rng::Rng,
     system::SystemControl,
@@ -24,7 +30,9 @@ use embassy_time::{with_timeout, Delay, Duration, Instant, Ticker, Timer};
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
     channel::{Channel, Sender},
+    mutex::Mutex,
 };
+use embassy_embedded_hal::shared_bus::asynch::spi::SpiDevice;
 
 use esp_println::println;
 use static_cell::{make_static, StaticCell};
@@ -75,12 +83,13 @@ static mut APP_CORE_STACK: CPUStack<8192> = CPUStack::new();
 
 #[embassy_executor::task]
 async fn motion_analysis(
-    i2c: I2C<'static, I2C0, Async>,
+    //spi_dev: SpiDevice<'static, CriticalSectionRawMutex, Spi<'static, SPI2, FullDuplexMode>, Output<'static, GpioPin<5>>>,
+    spi_dev: SpiDevice<'static, CriticalSectionRawMutex, SpiDma<'static, SPI2, Channel0, FullDuplexMode, Async>, Output<'static, GpioPin<5>>>,
     sender: Sender<'static, CriticalSectionRawMutex, SampleBuffer, NUM_BLOCKS>,
     mut flag_pin: Output<'static, GpioPin<2>>
 ) {
     // Create and await IMU object
-    let imu_configured = Icm20948::new_i2c(i2c, Delay)
+    let imu_configured = Icm20948::new_spi(spi_dev, Delay)
         // Configure accelerometer
         .acc_range(AccRange::Gs8)
         .acc_dlp(AccDlp::Hz111)
@@ -90,7 +99,7 @@ async fn motion_analysis(
         .gyr_dlp(GyrDlp::Hz120)
         .gyr_unit(GyrUnit::Dps)
         // Final initialization
-        .set_address(0x69);
+        ;
     let imu_result = imu_configured.initialize_9dof().await;
 
     // Unpack IMU result safely and print error if necessary
@@ -163,6 +172,9 @@ async fn motion_analysis(
     }
 }
 
+static SPI_BUS: StaticCell<Mutex<CriticalSectionRawMutex, SpiDma<SPI2, Channel0, FullDuplexMode, Async>>> = StaticCell::new();
+//static SPI_BUS: StaticCell<Mutex<CriticalSectionRawMutex, Spi<SPI2, FullDuplexMode>>> = StaticCell::new();
+//SpiDma<'_, SPI2, dma::gdma::Channel<0>, FullDuplexMode, Async>
 
 #[main]
 async fn main(spawner: Spawner) -> ! {
@@ -216,23 +228,33 @@ async fn main(spawner: Spawner) -> ! {
     // IMU bus start
     let sclk = io.pins.gpio8;
     let mosi = io.pins.gpio10;  // SDA on IMU board
-    //let miso = io.pins.gpio7;    // SDO on IMU board
-    //let cs = io.pins.gpio5;
+    let miso = io.pins.gpio7;    // SDO on IMU board
+    let cs = io.pins.gpio5;
 
-    let i2c0 = I2C::new_async(
-        peripherals.I2C0,
-        mosi,
-        sclk,
-        400.kHz(),
-        &clocks,
-    );
+    let dma = Dma::new(peripherals.DMA);
+    let dma_channel = dma.channel0;
+    let (descriptors, rx_descriptors) = dma_descriptors!(32000);
+    let spi = Spi::new(peripherals.SPI2, 2.MHz(), SpiMode::Mode0, &clocks)
+        .with_pins(Some(sclk), Some(mosi), Some(miso), Option::<AnyPin>::None)
+        .with_dma(
+            dma_channel.configure_for_async(false, DmaPriority::Priority0),
+            descriptors,
+            rx_descriptors,
+        )
+        ;
+    // Initialize the StaticCell with the configured SPI peripheral
+    let spi_bus = SPI_BUS.init(Mutex::new(spi));
+    // Set cs pin as output, and make new SpiDevice
+    let cs_pin = Output::new(cs, Level::Low);
+    let spi_dev = SpiDevice::new(spi_bus, cs_pin);
+
     // Offload IMU reading and motion analysis to second core
     let _guard = cpu_control
         .start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, move || {
             static EXECUTOR: StaticCell<Executor> = StaticCell::new();
             let executor = EXECUTOR.init(Executor::new());
             executor.run(|spawner| {
-                spawner.spawn(motion_analysis(i2c0, sender, flag)).unwrap();
+                spawner.spawn(motion_analysis(spi_dev, sender, flag)).unwrap();
             });
         })
         .unwrap();
